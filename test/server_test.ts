@@ -56,7 +56,7 @@ async function setup(limits: Partial<Config["limits"]> = {}) {
 		database: dbPath,
 		siteDir: "",
 		userAgent: "test",
-		limits: { maxBodyBytes: 16384, maxSubscriptions: 50, subscribesPerIpPerHour: 10, updatesPerIpPerHour: 100, maxNotificationsPerDay: 40, inactiveDays: null, ...limits },
+		limits: { maxBodyBytes: 16384, maxSubscriptions: 50, subscribesPerIpPerHour: 10, updatesPerIpPerHour: 100, maxNotificationsPerDay: 40, maxPlacesPerSubscription: 3, inactiveDays: null, ...limits },
 	};
 	const store = new Store(dbPath);
 	const pushes: { url: string; headers: Headers; body: Uint8Array<ArrayBuffer> }[] = [];
@@ -85,20 +85,22 @@ const opts = { sanitizeOps: false, sanitizeResources: false };
 Deno.test("plans the calendar's own times: sunset 6:11 PM on 18 Oct 2026, 5 minutes before", opts, () => {
 	const now = Date.parse("2026-10-18T17:00:00-04:00");
 	const planned = engine.plan({
-		location: NYC, settings: {}, display: DISPLAY as never, refraction: null, refractionId: "x",
+		location: NYC, settings: {}, display: DISPLAY as never, refraction: null, refractionId: "x", placeKey: "40.71280,-74.00600",
 		notifications: { sunset: { enabled: true, minutes: 5 }, "tzeit-regular": { enabled: true, minutes: 0 } },
 		now, horizonMs: 48 * 3600_000, graceMs: 120_000,
 	});
 	const first = planned.filter((p) => p.zman_at > now).sort((a, b) => a.fire_at - b.fire_at).slice(0, 2);
+	// the tag is the vendored site core's (with the place since the site's per-place change)
+	const tag = (key: string) => engine.core.notificationTag(key, Temporal.ZonedDateTime.from("2026-10-18T12:00[America/New_York]"), "40.71280,-74.00600");
 	assertEquals(first.map((p) => [p.zman_key, new Date(p.fire_at).toISOString(), p.time_text, p.tag]), [
-		["sunset", "2026-10-18T22:06:00.000Z", "6:11 PM", "zman-sunset-2026-10-18"],
-		["tzeit-regular", "2026-10-18T22:25:00.000Z", "6:25 PM", "zman-tzeit-regular-2026-10-18"],
+		["sunset", "2026-10-18T22:06:00.000Z", "6:11 PM", tag("sunset")],
+		["tzeit-regular", "2026-10-18T22:25:00.000Z", "6:25 PM", tag("tzeit-regular")],
 	]);
 	// two days ahead: today's, tomorrow's and the day after's (within 48 h)
 	assert(planned.length >= 4 && planned.length <= 6, `planned ${planned.length}`);
 });
 
-Deno.test("subscribe → notification sent at its time, encrypted for the browser, with the calendar's wording", opts, async () => {
+Deno.test("(one-location API, as the site had before places) subscribe → notification sent at its time, encrypted for the browser, with the calendar's wording", opts, async () => {
 	const { call, scheduler, pushes, store } = await setup();
 	const browser = await fakeBrowser("https://fcm.googleapis.com/fcm/send/abc123");
 	const res = await call("POST", "/v1/subscribe", {
@@ -132,7 +134,7 @@ Deno.test("subscribe → notification sent at its time, encrypted for the browse
 	assertEquals(message.url.split("?")[0], `${SITE}/calendar`);
 
 	// sent once: a replan doesn't queue it again, and it isn't sent twice
-	scheduler.plan(store.byToken(await hash(token))!, item.fire_at + 1000);
+	scheduler.planAll(store.byToken(await hash(token))!.id, item.fire_at + 1000);
 	await scheduler.sendDue(item.fire_at + 2000);
 	assertEquals(pushes.length, 1);
 });
@@ -142,7 +144,7 @@ async function hash(token: string) {
 	return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-Deno.test("update, read back, delete — only with the token", opts, async () => {
+Deno.test("(one-location API) update, read back, delete — only with the token", opts, async () => {
 	const { call } = await setup();
 	const browser = await fakeBrowser("https://updates.push.services.mozilla.com/wpush/v2/xyz");
 	const { token } = await (await call("POST", "/v1/subscribe", {
@@ -153,7 +155,8 @@ Deno.test("update, read back, delete — only with the token", opts, async () =>
 	assertEquals((await call("PUT", "/v1/subscription", { notifications: { sunset: { enabled: true, minutes: 30 } } })).status, 401);
 	assertEquals((await call("PUT", "/v1/subscription", { notifications: { sunset: { enabled: true, minutes: 30 } } }, auth)).status, 200);
 	const back = await (await call("GET", "/v1/subscription", undefined, auth)).json();
-	assertEquals(back.notifications.sunset, { enabled: true, minutes: 30 });
+	assertEquals(back.places.length, 1);
+	assertEquals(back.places[0].notifications.sunset, { enabled: true, minutes: 30 });
 	assertEquals((await call("DELETE", "/v1/subscription", undefined, auth)).status, 204);
 	assertEquals((await call("GET", "/v1/subscription", undefined, auth)).status, 401);
 });
@@ -218,4 +221,81 @@ Deno.test("a subscription the push service reports gone is removed", opts, async
 Deno.test("Hebrew wording, from the site's own text", opts, () => {
 	const text = engine.text({ zman_at: 0, minutes: 75, title: "שקיעה", time_text: "18:11" }, "he", "ירושלים", -75 * 60_000);
 	assertEquals(text, { title: "שקיעה בעוד שעה ו-15 דקות", body: "18:11 · ירושלים" });
+});
+
+const LA = { lat: 34.0522, lon: -118.2437, elevation: 90, timeZone: "America/Los_Angeles", name: "Los Angeles" };
+const BROOKLYN = { lat: 40.6782, lon: -73.9442, elevation: 20, timeZone: "America/New_York", name: "Brooklyn" };
+const keyOf = (l: { lat: number; lon: number }) => `${l.lat.toFixed(5)},${l.lon.toFixed(5)}`;
+
+Deno.test("places: Los Angeles and Brooklyn side by side, each with its own choices; removing one keeps the other", opts, async () => {
+	const { call, store } = await setup();
+	const b = await fakeBrowser("https://fcm.googleapis.com/fcm/send/places");
+	const res = await call("POST", "/v1/subscribe", { subscription: b.subscription, display: DISPLAY,
+		places: [{ location: LA, notifications: { candleLighting: { enabled: true, minutes: 30 } } }] });
+	assertEquals(res.status, 201);
+	const auth = { Authorization: `Bearer ${(await res.json()).token}` };
+
+	const put = await call("PUT", `/v1/places/${encodeURIComponent(keyOf(BROOKLYN))}`,
+		{ location: BROOKLYN, settings: { candles: "18" }, notifications: { sunset: { enabled: true, minutes: 15 } } }, auth);
+	assertEquals(put.status, 200);
+
+	let back = await (await call("GET", "/v1/subscription", undefined, auth)).json();
+	assertEquals(back.places.map((p: { key: string }) => p.key), [keyOf(LA), keyOf(BROOKLYN)]);
+	assertEquals(back.places[0].notifications, { candleLighting: { enabled: true, minutes: 30 } });
+	assertEquals(back.places[1].notifications, { sunset: { enabled: true, minutes: 15 } });
+	assertEquals(back.places[1].settings, { candles: "18" });
+
+	// each place's queue has its own zemanim (and, with the site's per-place core, its own tags)
+	const queued = (placeKey: string) => (store.db.prepare(`SELECT DISTINCT q.zman_key AS k FROM queue q JOIN places p ON p.id = q.place_id
+		WHERE p.place_key = ?`).all(placeKey) as { k: string }[]).map((r) => r.k).sort();
+	assertEquals(queued(keyOf(BROOKLYN)), ["sunset"]);
+	assertEquals(queued(keyOf(LA)).filter((k) => k !== "candleLighting"), [], "LA: only candle lighting chosen");
+	if (engine.core.placeKey) {
+		const tags = (store.db.prepare("SELECT DISTINCT tag FROM queue").all() as { tag: string }[]).map((r) => r.tag);
+		assert(tags.filter((t) => t.startsWith("zman-sunset-")).every((t) => t.endsWith("@" + keyOf(BROOKLYN))), tags.join());
+	}
+
+	assertEquals((await call("DELETE", `/v1/places/${encodeURIComponent(keyOf(LA))}`, undefined, auth)).status, 204);
+	back = await (await call("GET", "/v1/subscription", undefined, auth)).json();
+	assertEquals(back.places.map((p: { key: string }) => p.key), [keyOf(BROOKLYN)]);
+	assertEquals((await call("DELETE", `/v1/places/${encodeURIComponent(keyOf(LA))}`, undefined, auth)).status, 404);
+	assertEquals(queued(keyOf(LA)), [], "LA's queue is gone");
+});
+
+Deno.test("places: a cap per browser, keys must match their location, only with the token", opts, async () => {
+	const { call } = await setup();
+	const b = await fakeBrowser("https://fcm.googleapis.com/fcm/send/cap");
+	const auth = { Authorization: `Bearer ${(await (await call("POST", "/v1/subscribe", { subscription: b.subscription, display: DISPLAY })).json()).token}` };
+	const at = (lat: number) => ({ ...NYC, lat });
+	for (const lat of [40.1, 40.2, 40.3])
+		assertEquals((await call("PUT", `/v1/places/${keyOf(at(lat))}`, { location: at(lat), notifications: {} }, auth)).status, 200);
+	assertEquals((await call("PUT", `/v1/places/${keyOf(at(40.4))}`, { location: at(40.4), notifications: {} }, auth)).status, 409, "4th place");
+	assertEquals((await call("PUT", `/v1/places/${keyOf(at(40.1))}`, { location: at(40.1), notifications: { sunset: { enabled: true, minutes: 5 } } }, auth)).status, 200, "changing one is fine");
+	assertEquals((await call("PUT", `/v1/places/${keyOf(LA)}`, { location: BROOKLYN, notifications: {} }, auth)).status, 400, "key of another location");
+	assertEquals((await call("PUT", `/v1/places/not-a-key`, { location: BROOKLYN, notifications: {} }, auth)).status, 400, "bad key");
+	assertEquals((await call("PUT", `/v1/places/${keyOf(BROOKLYN)}`, { location: BROOKLYN, notifications: {} })).status, 401, "no token");
+});
+
+Deno.test("an old database (one location per browser) becomes one place per browser", opts, async () => {
+	const { DatabaseSync } = await import("node:sqlite");
+	await Deno.mkdir(new URL("./tmp/", import.meta.url), { recursive: true });
+	const path = new URL(`./tmp/v1-${crypto.randomUUID()}.db`, import.meta.url).pathname;
+	const old = new DatabaseSync(path);
+	old.exec(`CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, endpoint TEXT NOT NULL UNIQUE,
+		p256dh TEXT NOT NULL, auth TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, elevation REAL NOT NULL, time_zone TEXT NOT NULL,
+		location_name TEXT NOT NULL, settings TEXT NOT NULL, notifications TEXT NOT NULL, display TEXT NOT NULL, created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL, computed_at INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0);
+		CREATE TABLE queue (id INTEGER PRIMARY KEY, subscription_id INTEGER, notif_id TEXT);
+		CREATE TABLE sent (subscription_id INTEGER, notif_id TEXT, sent_at INTEGER);`);
+	old.prepare(`INSERT INTO subscriptions VALUES (7, 'hash', 'https://fcm.googleapis.com/fcm/send/old', 'p', 'a', 40.7128, -74.006, 10,
+		'America/New_York', 'New York', '{}', '{"sunset":{"enabled":true,"minutes":15}}', '{"language":"en"}', 1, 2, 0, 0)`).run();
+	old.close();
+
+	const store = new Store(path);
+	assertEquals(store.byToken("hash")?.id, 7);
+	const places = store.places(7);
+	assertEquals(places.map((p) => [p.place_key, p.location_name, p.notifications]),
+		[["40.71280,-74.00600", "New York", '{"sunset":{"enabled":true,"minutes":15}}']]);
+	new Store(path); // opening it again changes nothing
+	assertEquals(new Store(path).places(7).length, 1);
 });

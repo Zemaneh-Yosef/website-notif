@@ -90,6 +90,8 @@ export class ZmanimEngine {
 		display: Display;
 		refraction: RefractionData | null;
 		refractionId: string;
+		/** the site's placeKey(): part of the tag, so the same zeman at two places doesn't replace one another */
+		placeKey: string;
 		now: number;
 		horizonMs: number;
 		graceMs: number;
@@ -118,7 +120,7 @@ export class ZmanimEngine {
 					minutes: pref.minutes,
 					title: this.core.plainText(zman.title),
 					time_text: zman.timeText,
-					tag: this.core.notificationTag(zman.key, zman.time),
+					tag: this.core.notificationTag(zman.key, zman.time, input.placeKey),
 				});
 			}
 		}

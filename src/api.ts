@@ -1,16 +1,22 @@
 // The HTTP API the site calls (behind nginx, which adds TLS and its own rate limit):
 //
-//   GET    /v1/key            the VAPID public key (applicationServerKey)
-//   POST   /v1/subscribe      { subscription, location, settings, notifications, display } → { token }
-//   GET    /v1/subscription   (Authorization: Bearer <token>) what the server has
-//   PUT    /v1/subscription   (Bearer) any of the fields above
-//   DELETE /v1/subscription   (Bearer) stop and forget
-//   GET    /v1/health         status
+//   GET    /v1/key                  the VAPID public key (applicationServerKey)
+//   POST   /v1/subscribe            { subscription, display, places?: [{ location, settings, notifications }] } → { token }
+//   GET    /v1/subscription         (Authorization: Bearer <token>) the browser and its places
+//   PUT    /v1/subscription         (Bearer) { subscription?, display? }
+//   DELETE /v1/subscription         (Bearer) stop everything and forget this browser
+//   PUT    /v1/places/<lat,lon>     (Bearer) { location, settings, notifications }: add or change a place
+//   DELETE /v1/places/<lat,lon>     (Bearer) stop one place
+//   GET    /v1/health               status
+//
+// Before places, a browser had one location: `location`, `settings` and `notifications` at the top level of
+// POST /v1/subscribe and PUT /v1/subscription. That still works (as "this browser's only place"), so a page
+// from before the change keeps working until it is reloaded.
 
 import type { Config } from "./config.ts";
-import type { Store } from "./db.ts";
+import type { PlaceFields, Store, SubscriptionRow } from "./db.ts";
 import type { DriftCheck } from "./drift.ts";
-import { parsed, type Scheduler } from "./scheduler.ts";
+import { placeParsed, type Scheduler } from "./scheduler.ts";
 import * as v from "./validate.ts";
 import { b64urlEncode } from "./webpush.ts";
 import type { ZmanimEngine } from "./zmanim.ts";
@@ -36,6 +42,8 @@ async function sha256Hex(s: string) {
 	const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
 	return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+class TooMany extends Error {}
 
 export function createHandler(deps: {
 	config: Config;
@@ -86,6 +94,44 @@ export function createHandler(deps: {
 		return m ? store.byToken(await sha256Hex(m[1])) : undefined;
 	}
 
+	/** A place's fields, checked; the key is its location's */
+	function placeFields(body: Record<string, unknown>): { key: string; fields: PlaceFields } {
+		const loc = v.location(body.location);
+		return {
+			key: v.placeKeyOf(loc.lat, loc.lon),
+			fields: {
+				lat: loc.lat, lon: loc.lon, elevation: loc.elevation, time_zone: loc.timeZone, location_name: loc.name,
+				settings: JSON.stringify(v.settings(body.settings, engine.settingKeys)),
+				notifications: JSON.stringify(v.notifications(body.notifications ?? {}, zmanimKeys)),
+			},
+		};
+	}
+
+	function savePlace(subscriptionId: number, key: string, fields: PlaceFields, now: number) {
+		if (!store.place(subscriptionId, key) && store.places(subscriptionId).length >= config.limits.maxPlacesPerSubscription)
+			throw new TooMany(`at most ${config.limits.maxPlacesPerSubscription} places`);
+		const id = store.upsertPlace(subscriptionId, key, fields, now);
+		return scheduler.plan(store.placeById(id)!, now);
+	}
+
+	/** The pre-places shape: this browser's one location replaces whatever places it had */
+	function saveLegacyPlace(subscriptionId: number, body: Record<string, unknown>, now: number) {
+		const { key, fields } = placeFields(body);
+		for (const place of store.places(subscriptionId))
+			if (place.place_key !== key) store.deletePlace(subscriptionId, place.place_key);
+		return savePlace(subscriptionId, key, fields, now);
+	}
+
+	const describe = (row: SubscriptionRow) => ({
+		endpoint: row.endpoint,
+		display: JSON.parse(row.display),
+		updatedAt: row.updated_at,
+		places: store.places(row.id).map((place) => {
+			const p = placeParsed(place);
+			return { key: p.key, location: p.location, settings: p.settings, notifications: p.notifications, updatedAt: place.updated_at };
+		}),
+	});
+
 	return async function handle(req: Request, info: { remoteAddr: { hostname: string } }): Promise<Response> {
 		const url = new URL(req.url);
 		const headers = new Headers({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
@@ -109,7 +155,7 @@ export function createHandler(deps: {
 
 		try {
 			if (url.pathname === "/v1/health" && req.method === "GET")
-				return json(200, { ok: true, commit: engine.commit, subscriptions: store.count(), drift: drift.state }, headers);
+				return json(200, { ok: true, commit: engine.commit, subscriptions: store.count(), places: store.countPlaces(), drift: drift.state }, headers);
 
 			if (url.pathname === "/v1/key" && req.method === "GET")
 				return json(200, { publicKey: deps.publicKey }, headers);
@@ -118,12 +164,14 @@ export function createHandler(deps: {
 				if (!subscribeLimit.allow(ip)) return json(429, { error: "too many requests" }, headers);
 				const body = await readBody(req);
 				const sub = v.subscription(body.subscription);
-				const fields = {
-					location: v.location(body.location),
-					settings: v.settings(body.settings, engine.settingKeys),
-					notifications: v.notifications(body.notifications, zmanimKeys),
-					display: v.display(body.display),
-				};
+				const display = v.display(body.display);
+				// check every place before storing anything
+				const places = Array.isArray(body.places) ? body.places.map((p) => placeFields(p as Record<string, unknown>)) : [];
+				if (body.places !== undefined && !Array.isArray(body.places)) throw new v.Invalid("places: expected a list");
+				if (places.length > config.limits.maxPlacesPerSubscription) throw new TooMany(`at most ${config.limits.maxPlacesPerSubscription} places`);
+				const legacy = body.location !== undefined;
+				if (legacy) placeFields(body);
+
 				if (store.endpointOwner(sub.endpoint) === null && store.count() >= config.limits.maxSubscriptions) {
 					log(`refused a subscription: the limit of ${config.limits.maxSubscriptions} is reached`);
 					return json(503, { error: "not taking new subscriptions right now" }, headers);
@@ -132,14 +180,12 @@ export function createHandler(deps: {
 				const token = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
 				const now = Date.now();
 				const id = store.upsert({
-					token_hash: await sha256Hex(token),
-					endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth,
-					lat: fields.location.lat, lon: fields.location.lon, elevation: fields.location.elevation,
-					time_zone: fields.location.timeZone, location_name: fields.location.name,
-					settings: JSON.stringify(fields.settings), notifications: JSON.stringify(fields.notifications),
-					display: JSON.stringify(fields.display), created_at: now, updated_at: now,
+					token_hash: await sha256Hex(token), endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth,
+					display: JSON.stringify(display), created_at: now, updated_at: now,
 				});
-				const queued = scheduler.plan(store.byId(id)!, now);
+				let queued = 0;
+				for (const { key, fields } of places) queued += savePlace(id, key, fields, now);
+				if (legacy) queued += saveLegacyPlace(id, body, now);
 				return json(201, { token, queued }, headers);
 			}
 
@@ -149,10 +195,7 @@ export function createHandler(deps: {
 				const row = await authorized(req);
 				if (!row) return json(401, { error: "unknown or missing token" }, headers);
 
-				if (req.method === "GET") {
-					const sub = parsed(row);
-					return json(200, { ...sub, endpoint: row.endpoint, updatedAt: row.updated_at }, headers);
-				}
+				if (req.method === "GET") return json(200, describe(row), headers);
 
 				if (req.method === "DELETE") {
 					store.delete(row.id);
@@ -160,28 +203,61 @@ export function createHandler(deps: {
 				}
 
 				const body = await readBody(req);
-				const changes: Record<string, string | number> = { updated_at: Date.now() };
+				const now = Date.now();
+				const changes: Partial<SubscriptionRow> = { updated_at: now };
 				if ("subscription" in body) {
 					const sub = v.subscription(body.subscription);
 					const owner = store.endpointOwner(sub.endpoint);
 					if (owner !== null && owner !== row.id) store.delete(owner); // an older registration of the same browser
 					Object.assign(changes, { endpoint: sub.endpoint, p256dh: sub.p256dh, auth: sub.auth, failures: 0 });
 				}
-				if ("location" in body) {
-					const loc = v.location(body.location);
-					Object.assign(changes, { lat: loc.lat, lon: loc.lon, elevation: loc.elevation, time_zone: loc.timeZone, location_name: loc.name });
-				}
-				if ("settings" in body) changes.settings = JSON.stringify(v.settings(body.settings, engine.settingKeys));
-				if ("notifications" in body) changes.notifications = JSON.stringify(v.notifications(body.notifications, zmanimKeys));
 				if ("display" in body) changes.display = JSON.stringify(v.display(body.display));
+				if ("location" in body) placeFields(body); // check before changing anything
+				if ("settings" in body) v.settings(body.settings, engine.settingKeys);
+				if ("notifications" in body) v.notifications(body.notifications, zmanimKeys);
 				store.update(row.id, changes);
-				const queued = scheduler.plan(store.byId(row.id)!);
+				let queued = 0;
+				const legacyChoices = !("location" in body) && ("settings" in body || "notifications" in body);
+				if ("location" in body) queued = saveLegacyPlace(row.id, body, now);
+				else if (legacyChoices) {
+					// the one-location shape without the location: change the browser's only place
+					const places = store.places(row.id);
+					if (places.length !== 1) throw new v.Invalid("settings and notifications belong to a place: use /v1/places/<key>");
+					const p = placeParsed(places[0]);
+					queued = saveLegacyPlace(row.id, {
+						location: p.location,
+						settings: "settings" in body ? body.settings : p.settings,
+						notifications: "notifications" in body ? body.notifications : p.notifications,
+					}, now);
+				} else if ("display" in body) queued = scheduler.planAll(row.id, now);
 				return json(200, { queued }, headers);
+			}
+
+			const placeMatch = url.pathname.match(/^\/v1\/places\/([^/]+)$/);
+			if (placeMatch) {
+				if (req.method !== "PUT" && req.method !== "DELETE") return json(405, { error: "method not allowed" }, headers);
+				if (!updateLimit.allow(ip)) return json(429, { error: "too many requests" }, headers);
+				const row = await authorized(req);
+				if (!row) return json(401, { error: "unknown or missing token" }, headers);
+
+				if (req.method === "DELETE") {
+					const key = v.placeKey(placeMatch[1]);
+					return store.deletePlace(row.id, key) ? json(204, null, headers) : json(404, { error: "no such place" }, headers);
+				}
+
+				const body = await readBody(req);
+				const { key, fields } = placeFields(body);
+				v.placeKey(placeMatch[1], { lat: fields.lat, lon: fields.lon } as never);
+				const now = Date.now();
+				const queued = savePlace(row.id, key, fields, now);
+				store.update(row.id, { updated_at: now });
+				return json(200, { key, queued }, headers);
 			}
 
 			return json(404, { error: "not found" }, headers);
 		} catch (e) {
 			if (e instanceof v.Invalid) return json(400, { error: e.message }, headers);
+			if (e instanceof TooMany) return json(409, { error: e.message }, headers);
 			log(`request ${req.method} ${url.pathname} failed: ${(e as Error)?.stack ?? e}`);
 			return json(500, { error: "server error" }, headers);
 		}

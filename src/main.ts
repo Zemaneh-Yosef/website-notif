@@ -24,8 +24,8 @@ const engine = await ZmanimEngine.load(config.siteDir);
 const store = new Store(config.database);
 
 const refraction = new RefractionCache(engine, config.refractionServer, (lat, lon) => {
-	// new forecast for a place: plan everyone there again on the next tick
-	for (const id of store.atLocation(lat, lon)) store.update(id, { computed_at: 0 });
+	// new forecast for a place: plan everyone's places there again on the next tick
+	store.replanAt(lat, lon);
 }, log);
 
 const scheduler = new Scheduler(store, engine, refraction, vapid, config, log);
@@ -37,7 +37,7 @@ setInterval(() => {
 	const removed = store.prune(now, config.limits.inactiveDays === null ? null : now - config.limits.inactiveDays * 86_400_000);
 	if (removed) log(`removed ${removed} inactive subscription(s)`);
 	// and forget the refraction data of places nobody is subscribed at any more
-	const places = store.db.prepare("SELECT DISTINCT lat, lon, settings FROM subscriptions").all() as { lat: number; lon: number; settings: string }[];
+	const places = store.distinctPlaces();
 	refraction.retain(new Set(places.map((p) => RefractionCache.key(p.lat, p.lon, engine.wantsHumidity(JSON.parse(p.settings))))));
 }, 24 * 60 * 60 * 1000);
 
@@ -48,5 +48,5 @@ Deno.serve({
 	hostname: config.listen.hostname,
 	port: config.listen.port,
 	onListen: ({ hostname, port }) =>
-		log(`listening on ${hostname}:${port}; zmanim code at ${engine.commit.slice(0, 7)}; ${store.count()} subscription(s)`),
+		log(`listening on ${hostname}:${port}; zmanim code at ${engine.commit.slice(0, 7)}; ${store.count()} subscription(s), ${store.countPlaces()} place(s)`),
 }, createHandler({ config, store, engine, scheduler, drift, publicKey: vapid.publicKey, log }));

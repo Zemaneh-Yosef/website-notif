@@ -17,6 +17,7 @@
 		"subscribesPerIpPerHour": 10,
 		"updatesPerIpPerHour": 120,
 		"maxNotificationsPerDay": 40,
+		"maxPlacesPerSubscription": 10,
 		"inactiveDays": null
 	}
 }

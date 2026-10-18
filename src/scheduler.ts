@@ -1,11 +1,11 @@
-// Plans each subscriber's notifications and sends them when due.
+// Plans each place's notifications and sends them when due.
 //
-// Planning runs the site's calculation for the next two days and stores what to send; it is redone when the
-// subscriber changes anything, when their place's forecast is refreshed, and every few hours (which also
-// rolls the window past midnight). Sending checks the queue every 30 seconds.
+// Planning runs the site's calculation for the next two days at one place and stores what to send; it is
+// redone when the subscriber changes the place, when the place's forecast is refreshed, and every few hours
+// (which also rolls the window past midnight). Sending checks the queue every 30 seconds.
 
 import type { Config } from "./config.ts";
-import type { QueuedRow, Store, SubscriptionRow } from "./db.ts";
+import type { PlaceRow, QueuedRow, Store } from "./db.ts";
 import type { RefractionCache } from "./refraction.ts";
 import { b64urlEncode, sendPush, type Vapid } from "./webpush.ts";
 import type { Display, Location, NotificationPref, ZmanimEngine } from "./zmanim.ts";
@@ -21,12 +21,12 @@ const PLANS_PER_TICK = 200;
 const SENDS_PER_TICK = 500;
 const SEND_CONCURRENCY = 8;
 
-export function parsed(row: SubscriptionRow) {
+export function placeParsed(row: PlaceRow) {
 	return {
+		key: row.place_key,
 		location: { lat: row.lat, lon: row.lon, elevation: row.elevation, timeZone: row.time_zone, name: row.location_name } as Location,
 		settings: JSON.parse(row.settings) as Record<string, string>,
 		notifications: JSON.parse(row.notifications) as Record<string, NotificationPref>,
-		display: JSON.parse(row.display) as Display,
 	};
 }
 
@@ -53,27 +53,38 @@ export class Scheduler {
 		if (this.#timer !== null) clearInterval(this.#timer);
 	}
 
-	/** Plan one subscriber now; returns how many notifications are queued */
-	plan(row: SubscriptionRow, now = Date.now()): number {
-		const sub = parsed(row);
-		const humidity = this.engine.wantsHumidity(sub.settings);
-		const { data, id } = this.refraction.get(sub.location.lat, sub.location.lon, humidity, now);
-		const planned = this.engine.plan({ ...sub, refraction: data, refractionId: id, now, horizonMs: HORIZON_MS, graceMs: GRACE_MS });
-		this.store.replaceQueue(row.id, planned, now);
+	/** Plan one place now; returns how many notifications are queued */
+	plan(place: PlaceRow, now = Date.now()): number {
+		const subscription = this.store.byId(place.subscription_id);
+		if (!subscription) return 0;
+		const p = placeParsed(place);
+		const display = JSON.parse(subscription.display) as Display;
+		const humidity = this.engine.wantsHumidity(p.settings);
+		const { data, id } = this.refraction.get(p.location.lat, p.location.lon, humidity, now);
+		const planned = this.engine.plan({
+			location: p.location, settings: p.settings, notifications: p.notifications, display,
+			refraction: data, refractionId: id, placeKey: p.key, now, horizonMs: HORIZON_MS, graceMs: GRACE_MS,
+		});
+		this.store.replaceQueue(place, planned, now);
 		return planned.length;
+	}
+
+	/** Plan every place of a subscription (its display options changed) */
+	planAll(subscriptionId: number, now = Date.now()): number {
+		return this.store.places(subscriptionId).reduce((n, place) => n + this.plan(place, now), 0);
 	}
 
 	async tick(now = Date.now()) {
 		if (this.#busy) return;
 		this.#busy = true;
 		try {
-			for (const row of this.store.stale(now - REPLAN_MS, PLANS_PER_TICK)) {
+			for (const place of this.store.stalePlaces(now - REPLAN_MS, PLANS_PER_TICK)) {
 				try {
-					this.plan(row, now);
+					this.plan(place, now);
 				} catch (e) {
 					// keep it from blocking the others; it is tried again after REPLAN_MS
-					this.store.update(row.id, { computed_at: now });
-					this.log(`planning subscription ${row.id} failed: ${(e as Error)?.stack ?? e}`);
+					this.store.replaceQueue(place, [], now);
+					this.log(`planning place ${place.id} failed: ${(e as Error)?.stack ?? e}`);
 				}
 				await new Promise((r) => setTimeout(r, 0)); // let requests in between
 			}
@@ -91,23 +102,25 @@ export class Scheduler {
 
 	async #send(item: QueuedRow, now: number) {
 		if (item.zman_at + GRACE_MS <= now) return this.store.drop(item);
-		const row = this.store.byId(item.subscription_id);
-		if (!row) return;
-		if (this.store.sentToday(row.id, now - 24 * 60 * 60 * 1000) >= this.config.limits.maxNotificationsPerDay) {
-			this.log(`subscription ${row.id}: daily limit reached, dropped ${item.notif_id}`);
+		const subscription = this.store.byId(item.subscription_id);
+		const place = this.store.placeById(item.place_id);
+		if (!subscription || !place) return;
+		if (this.store.sentToday(place.id, now - 24 * 60 * 60 * 1000) >= this.config.limits.maxNotificationsPerDay) {
+			this.log(`place ${place.id}: daily limit reached, dropped ${item.notif_id}`);
 			return this.store.drop(item);
 		}
 
-		const sub = parsed(row);
-		const { title, body } = this.engine.text(item, sub.display.language, sub.location.name, now);
+		const p = placeParsed(place);
+		const display = JSON.parse(subscription.display) as Display;
+		const { title, body } = this.engine.text(item, display.language, p.location.name, now);
 		const topic = b64urlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(item.tag)))).slice(0, 32);
 
 		let result;
 		try {
 			result = await sendPush(this.vapid, {
-				endpoint: row.endpoint,
-				keys: { p256dh: row.p256dh, auth: row.auth },
-				payload: { v: 1, title, body, tag: item.tag, timestamp: item.zman_at, url: this.#calendarUrl(sub.location) },
+				endpoint: subscription.endpoint,
+				keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+				payload: { v: 1, title, body, tag: item.tag, timestamp: item.zman_at, url: this.#calendarUrl(p.location) },
 				ttl: Math.ceil((item.zman_at + GRACE_MS - now) / 1000),
 				urgency: "high",
 				topic,
@@ -118,23 +131,23 @@ export class Scheduler {
 
 		if (result.ok) {
 			this.store.markSent(item, now);
-			if (row.failures) this.store.update(row.id, { failures: 0 });
+			if (subscription.failures) this.store.update(subscription.id, { failures: 0 });
 			return;
 		}
 		if (result.gone) {
-			this.log(`subscription ${row.id}: push service says it is gone (${result.status}); removed`);
-			return this.store.delete(row.id);
+			this.log(`subscription ${subscription.id}: push service says it is gone (${result.status}); removed`);
+			return this.store.delete(subscription.id);
 		}
 		if (result.status === 429 || result.status >= 500)
 			return this.#retry(item, now, result.retryAfterMs, `${result.status} ${result.detail}`);
 
 		// 400 / 403 / 413…: this message won't go through as it is
 		this.store.drop(item);
-		this.store.update(row.id, { failures: row.failures + 1 });
-		this.log(`subscription ${row.id}: push refused (${result.status} ${result.detail})`);
-		if (row.failures + 1 >= 20) {
-			this.log(`subscription ${row.id}: refused 20 times in a row; removed`);
-			this.store.delete(row.id);
+		this.store.update(subscription.id, { failures: subscription.failures + 1 });
+		this.log(`subscription ${subscription.id}: push refused (${result.status} ${result.detail})`);
+		if (subscription.failures + 1 >= 20) {
+			this.log(`subscription ${subscription.id}: refused 20 times in a row; removed`);
+			this.store.delete(subscription.id);
 		}
 	}
 

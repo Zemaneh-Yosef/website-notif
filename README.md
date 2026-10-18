@@ -25,24 +25,37 @@ and the database is Deno's built-in SQLite. Deno's permissions limit it to its o
 
 ## API
 
+A subscription is one browser; it has **places** (up to 10), each with its own location, zemanim settings and
+per-zeman choices. A place's key is the site's `placeKey(lat, lon)`: its coordinates to 5 decimals, `40.71280,-74.00600`.
+
 | | |
 |---|---|
 | `GET /v1/key` | the VAPID public key |
-| `POST /v1/subscribe` | `{ subscription, location, settings, notifications, display }` → `{ token }` |
-| `GET /v1/subscription` | `Authorization: Bearer <token>`: what the server has |
-| `PUT /v1/subscription` | `Bearer`: any of the fields above |
-| `DELETE /v1/subscription` | `Bearer`: stop and forget |
+| `POST /v1/subscribe` | `{ subscription, display, places? }` → `{ token }` |
+| `GET /v1/subscription` | `Authorization: Bearer <token>`: the browser and its places |
+| `PUT /v1/subscription` | `Bearer`: `{ subscription?, display? }` |
+| `DELETE /v1/subscription` | `Bearer`: stop everything and forget this browser |
+| `PUT /v1/places/<key>` | `Bearer`: `{ location, settings, notifications }`, add or change a place |
+| `DELETE /v1/places/<key>` | `Bearer`: stop one place |
 | `GET /v1/health` | status, the pinned commit, and the drift check |
 
 ```jsonc
+// POST /v1/subscribe
 {
 	"subscription": { "endpoint": "https://fcm.googleapis.com/…", "keys": { "p256dh": "…", "auth": "…" } },
-	"location": { "lat": 40.7128, "lon": -74.006, "elevation": 10, "timeZone": "America/New_York", "name": "New York" },
-	"settings": { "candles": "18" },                              // only the site's ZMANIM_SETTING_KEYS
-	"notifications": { "sunset": { "enabled": true, "minutes": 15 } },  // keys from the site's zmanim list
-	"display": { "language": "en", "hourCycle": "h12", "seconds": false, "locale": "en-US" }
+	"display": { "language": "en", "hourCycle": "h12", "seconds": false, "locale": "en-US" },
+	"places": [{
+		"location": { "lat": 40.6782, "lon": -73.9442, "elevation": 20, "timeZone": "America/New_York", "name": "Brooklyn" },
+		"settings": { "candles": "18" },                              // only the site's ZMANIM_SETTING_KEYS
+		"notifications": { "sunset": { "enabled": true, "minutes": 15 } }   // keys from the site's zmanim list
+	}]
 }
 ```
+
+Before places, a browser had one location, sent as `location`, `settings` and `notifications` at the top level of
+`POST /v1/subscribe` and `PUT /v1/subscription`. That shape still works, as "this browser's only place", so a page
+loaded before the change keeps working. Databases from before places are migrated when the service starts: each
+browser's location becomes its one place.
 
 ## Safeguards
 
@@ -54,8 +67,8 @@ and the database is Deno's built-in SQLite. Deno's permissions limit it to its o
 - **Checked input.** Unknown settings or zemanim, minutes outside 0–1440, impossible coordinates, unknown time zones
   and bodies over 16 KB are refused.
 - **A token per subscription.** 32 random bytes, stored only as a SHA-256 hash.
-- **Limits.** Per address: 10 new subscriptions and 120 changes an hour (on top of nginx's limits). At most 40
-  notifications per subscription per day, and 50,000 subscriptions in all. All adjustable in the config.
+- **Limits.** Per address: 10 new subscriptions and 120 changes an hour (on top of nginx's limits). At most 10
+  places per browser, 40 notifications per place per day, and 50,000 subscriptions in all. All adjustable in the config.
 - **Cleanup.** A subscription is removed when its push service says it's gone (404/410), or after 20 refusals in a row.
   Inactive subscriptions are kept by default (`inactiveDays: null`), so someone who never opens the site again keeps
   their notifications.

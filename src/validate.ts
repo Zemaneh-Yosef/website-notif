@@ -99,3 +99,17 @@ export function display(value: unknown): Display {
 	}
 	return { language, hourCycle, seconds: seconds === true, locale: cleanLocale };
 }
+
+/** The site's placeKey(lat, lon) (core/notificationText.js): coordinates to 5 decimals */
+export function placeKeyOf(lat: number, lon: number) {
+	return `${lat.toFixed(5)},${lon.toFixed(5)}`;
+}
+
+/** A place key from a URL; it must be the one of the place's location */
+export function placeKey(value: string, loc?: Location): string {
+	let key: string;
+	try { key = decodeURIComponent(value); } catch { throw new Invalid("place: bad key"); }
+	if (!/^-?\d{1,3}\.\d{5},-?\d{1,3}\.\d{5}$/.test(key)) throw new Invalid("place: bad key");
+	if (loc && placeKeyOf(loc.lat, loc.lon) !== key) throw new Invalid("place: the key doesn't match the location");
+	return key;
+}

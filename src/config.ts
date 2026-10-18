@@ -27,8 +27,10 @@ export interface Limits {
 	subscribesPerIpPerHour: number;
 	/** updates and deletes per IP address per hour */
 	updatesPerIpPerHour: number;
-	/** notifications sent to one subscription per day, whatever its settings */
+	/** notifications sent for one place per day, whatever its settings */
 	maxNotificationsPerDay: number;
+	/** places one browser can subscribe to */
+	maxPlacesPerSubscription: number;
 	/**
 	 * remove a subscription not updated for this many days; null (the default) = never, so someone who never
 	 * opens the site again keeps getting notifications. Revoked subscriptions go when the push service says so.
@@ -42,6 +44,7 @@ const DEFAULT_LIMITS: Limits = {
 	subscribesPerIpPerHour: 10,
 	updatesPerIpPerHour: 120,
 	maxNotificationsPerDay: 40,
+	maxPlacesPerSubscription: 10,
 	inactiveDays: null,
 };
 
