@@ -133,8 +133,7 @@ sudo systemctl restart royzmanim-notif
 `SITE_COMMIT`. After moving the pin, commit `SITE_COMMIT` here so the repository records which code is running.
 `/v1/health` shows the running commit and whether the site's zmanim files changed since (`drift.changedFiles`).
 
-`SITE_COMMIT` currently points at the `zmanim-core` branch of the site (PR #49). Once that PR is merged, run
-`./scripts/update.sh --latest`.
+`SITE_COMMIT` points at the site's `main` branch (moved there once the zmanim core, PR #49, was merged).
 
 ## Development
 
