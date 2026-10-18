@@ -96,12 +96,27 @@ journalctl -u royzmanim-notif -f        # "listening on 127.0.0.1:8790; zmanim c
 
 # 5. nginx and TLS (DNS: an A record for notifs.royzmanim.com pointing here)
 sudo cp deploy/nginx-proxy.conf /etc/nginx/royzmanim-notif-proxy.conf
+sudo ./deploy/cloudflare-realip.sh       # behind Cloudflare: the visitor's real address (see below)
 sudo cp deploy/nginx.conf /etc/nginx/sites-available/notifs.royzmanim.com
 sudo ln -s ../sites-available/notifs.royzmanim.com /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 sudo certbot --nginx -d notifs.royzmanim.com
 curl https://notifs.royzmanim.com/v1/health
 ```
+
+### Behind Cloudflare
+
+`deploy/cloudflare-realip.sh` writes `/etc/nginx/cloudflare-realip.conf`, which the site's nginx config includes: nginx
+then takes the visitor's address from `CF-Connecting-IP`, but only on requests that come from Cloudflare's own address
+ranges. That's what the rate limits (nginx's and the service's) count by. Cloudflare's ranges change now and then, so
+run it monthly:
+
+```sh
+sudo install -m 755 deploy/cloudflare-realip.sh /etc/cron.monthly/cloudflare-realip
+```
+
+In Cloudflare, set SSL/TLS to **Full (strict)** (the origin has a real Let's Encrypt certificate). Certbot's renewals
+keep working through Cloudflare's proxy.
 
 After `deno upgrade` (which only updates `~/.deno/bin`), run step 0 again and restart the service.
 
