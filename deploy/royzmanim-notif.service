@@ -1,0 +1,40 @@
+[Unit]
+Description=Zemaneh Yosef zeman notifications (Web Push)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=royzmanim-notif
+Group=royzmanim-notif
+WorkingDirectory=/opt/royzmanim-notif
+Environment=DENO_DIR=/var/lib/royzmanim-notif/deno
+Environment=DENO_NO_UPDATE_CHECK=1
+# Deno's own sandbox: read only the code, the config and the key; write only the database; reach only these hosts.
+#   127.0.0.1:8790 (listen), 127.0.0.1:8787 (hanetz), the push services, the weather services the site uses, GitHub (drift check)
+ExecStart=/usr/local/bin/deno run --no-prompt --no-remote --cached-only \
+	--allow-read=/opt/royzmanim-notif,/etc/royzmanim-notif,/var/lib/royzmanim-notif \
+	--allow-write=/var/lib/royzmanim-notif \
+	--allow-net=127.0.0.1:8790,127.0.0.1:8787,fcm.googleapis.com,updates.push.services.mozilla.com,web.push.apple.com,*.notify.windows.com,api.open-meteo.com,archive-api.open-meteo.com,marine-api.open-meteo.com,air-quality-api.open-meteo.com,api.weather.gov,www.ncei.noaa.gov,oceanwatch.aoml.noaa.gov,api.github.com \
+	src/main.ts /etc/royzmanim-notif/config.json
+Restart=on-failure
+RestartSec=5
+
+# And the system's: a locked-down user and filesystem around it
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/royzmanim-notif
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

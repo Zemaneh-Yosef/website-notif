@@ -1,0 +1,22 @@
+{
+	"listen": { "hostname": "127.0.0.1", "port": 8790 },
+	"allowedOrigins": ["https://royzmanim.com", "https://www.royzmanim.com"],
+	"siteOrigin": "https://royzmanim.com",
+	"vapid": {
+		"privateKeyFile": "/etc/royzmanim-notif/vapid_private.pem",
+		"publicKey": "BNE13vdqppwZei95Cpm8kI5YDhMETmAcRl5_jhzLJ4Sq51q94lbhJc3RymYyUXj0f6qTccMt54ENNdS00ENWzPQ",
+		"subject": "mailto:email@nightscri.pt"
+	},
+	"refractionServer": "http://127.0.0.1:8787",
+	"database": "/var/lib/royzmanim-notif/notif.db",
+	"siteDir": "/opt/royzmanim-notif/vendor/site",
+	"userAgent": "ZemanehYosefNotifications/1.0 (+https://royzmanim.com; email@nightscri.pt)",
+	"limits": {
+		"maxBodyBytes": 16384,
+		"maxSubscriptions": 50000,
+		"subscribesPerIpPerHour": 10,
+		"updatesPerIpPerHour": 120,
+		"maxNotificationsPerDay": 40,
+		"inactiveDays": null
+	}
+}
