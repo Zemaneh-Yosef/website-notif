@@ -67,6 +67,10 @@ and the database is Deno's built-in SQLite. Deno's permissions limit it to its o
 ## Setup (Ubuntu, nginx; Deno already installed)
 
 ```sh
+# 0. Deno where sudo and the service can use it (the installer puts it in ~/.deno/bin, which neither can reach)
+sudo install -m 755 "$(command -v deno)" /usr/local/bin/deno
+sudo deno --version
+
 # 1. A user and directories
 sudo useradd --system --home /var/lib/royzmanim-notif --shell /usr/sbin/nologin royzmanim-notif
 sudo mkdir -p /opt/royzmanim-notif /var/lib/royzmanim-notif /etc/royzmanim-notif
@@ -99,7 +103,7 @@ sudo certbot --nginx -d notifs.royzmanim.com
 curl https://notifs.royzmanim.com/v1/health
 ```
 
-If `which deno` isn't `/usr/local/bin/deno`, change the path in the service file.
+After `deno upgrade` (which only updates `~/.deno/bin`), run step 0 again and restart the service.
 
 ## Updating
 
